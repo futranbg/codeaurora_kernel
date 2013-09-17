@@ -375,8 +375,9 @@ EXPORT_SYMBOL_GPL(kernel_halt);
 void kernel_power_off(void)
 {
 	kernel_shutdown_prepare(SYSTEM_POWER_OFF);
-	if (pm_power_off_prepare)
+	if (pm_power_off_prepare){
 		pm_power_off_prepare();
+		}
 	disable_nonboot_cpus();
 	syscore_shutdown();
 	printk(KERN_EMERG "Power down.\n");
@@ -439,6 +440,7 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		panic("cannot halt");
 
 	case LINUX_REBOOT_CMD_POWER_OFF:
+		printk(KERN_EMERG "LINUX_REBOOT_CMD_POWER_OFF\n");
 		kernel_power_off();
 		do_exit(0);
 		break;

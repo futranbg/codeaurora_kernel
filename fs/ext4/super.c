@@ -53,6 +53,10 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/ext4.h>
 
+#ifdef CONFIG_PANTECH_EXT4_USERDATA_RECOVERY //leecy add for recovery userdata
+#include "../../arch/arm/mach-msm/sky_sys_reset.h"
+#endif
+
 static struct proc_dir_entry *ext4_proc_root;
 static struct kset *ext4_kset;
 static struct ext4_lazy_init *ext4_li_info;
@@ -415,6 +419,18 @@ static void ext4_handle_error(struct super_block *sb)
 	if (test_opt(sb, ERRORS_RO)) {
 		ext4_msg(sb, KERN_CRIT, "Remounting filesystem read-only");
 		sb->s_flags |= MS_RDONLY;
+
+		//TODO :: process in case of data partition only
+#ifdef CONFIG_PANTECH_EXT4_USERDATA_RECOVERY //leecy add for recovery userdata
+
+		if(strcmp(sb->s_id, "mmcblk0p14")==0)
+		{
+			sky_reset_reason =  SYS_RESET_REASON_USERDATA_FS;
+			panic("EXT4-fs (device %s) ERRORS_RO : panic forced after error\n",
+			sb->s_id);
+		}
+
+#endif		
 	}
 	if (test_opt(sb, ERRORS_PANIC))
 		panic("EXT4-fs (device %s): panic forced after error\n",
@@ -579,6 +595,19 @@ void __ext4_abort(struct super_block *sb, const char *function,
 		if (EXT4_SB(sb)->s_journal)
 			jbd2_journal_abort(EXT4_SB(sb)->s_journal, -EIO);
 		save_error_info(sb, function, line);
+		
+		//TODO :: process in case of data partition only
+#ifdef CONFIG_PANTECH_EXT4_USERDATA_RECOVERY //leecy add for recovery userdata
+
+		if(strcmp(sb->s_id, "mmcblk0p14")==0)
+		{
+			sky_reset_reason =  SYS_RESET_REASON_USERDATA_FS;
+			panic("EXT4-fs (device %s) ERRORS_RO : panic forced after error\n",
+			sb->s_id);
+		}
+
+#endif		
+
 	}
 	if (test_opt(sb, ERRORS_PANIC))
 		panic("EXT4-fs panic from previous error\n");

@@ -96,9 +96,11 @@ extern void tcp_time_wait(struct sock *sk, int state, int timeo);
 				 * RFC1122 says that the limit is 100 sec.
 				 * 15 is ~13-30min depending on RTO.
 				 */
-
-#define TCP_SYN_RETRIES	 5	/* number of times to retry active opening a
+//[ FEATURE_LGT_DS_TCP_SYN_RETRANSMIT
+//Change 5 to 6
+#define TCP_SYN_RETRIES	 6	/* number of times to retry active opening a
 				 * connection: ~180sec is RFC minimum	*/
+//] FEATURE_LGT_DS_TCP_SYN_RETRANSMIT
 
 #define TCP_SYNACK_RETRIES 5	/* number of times to retry passive opening a
 				 * connection: ~180sec is RFC minimum	*/
@@ -1403,6 +1405,8 @@ extern struct sk_buff **tcp4_gro_receive(struct sk_buff **head,
 					 struct sk_buff *skb);
 extern int tcp_gro_complete(struct sk_buff *skb);
 extern int tcp4_gro_complete(struct sk_buff *skb);
+
+extern int tcp_nuke_addr(struct net *net, struct sockaddr *addr);
 
 #ifdef CONFIG_PROC_FS
 extern int tcp4_proc_init(void);

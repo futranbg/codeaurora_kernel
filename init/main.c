@@ -129,6 +129,15 @@ static char *static_command_line;
 static char *execute_command;
 static char *ramdisk_execute_command;
 
+#if defined(CONFIG_SKY_SMB136S_CHARGER) || defined(CONFIG_SKY_SMB137B_CHARGER)
+static unsigned int battchg_pause_logo;
+
+unsigned int sky_charging_status(void)
+{
+	return battchg_pause_logo;
+}
+EXPORT_SYMBOL(sky_charging_status);
+#endif //CONFIG_SKY_CHARGING
 /*
  * If set, this is an indication to the drivers that reset the underlying
  * device before going ahead with the initialization otherwise driver might
@@ -347,6 +356,7 @@ static __initdata DECLARE_COMPLETION(kthreadd_done);
 static noinline void __init_refok rest_init(void)
 {
 	int pid;
+	const struct sched_param param = { .sched_priority = 1 };
 
 	rcu_scheduler_starting();
 	/*
@@ -360,6 +370,7 @@ static noinline void __init_refok rest_init(void)
 	rcu_read_lock();
 	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
 	rcu_read_unlock();
+	sched_setscheduler_nocheck(kthreadd_task, SCHED_FIFO, &param);
 	complete(&kthreadd_done);
 
 	/*
@@ -501,6 +512,11 @@ asmlinkage void __init start_kernel(void)
 	parse_args("Booting kernel", static_command_line, __start___param,
 		   __stop___param - __start___param,
 		   &unknown_bootoption);
+#if defined(CONFIG_SKY_SMB136S_CHARGER) || defined(CONFIG_SKY_SMB137B_CHARGER)
+	if (strstr(boot_command_line,"androidboot.battchg_pause=true")) {
+		battchg_pause_logo = 1;
+	}
+#endif  //CONFIG_SKY_CHARGING
 	/*
 	 * These use large bootmem allocations and must precede
 	 * kmem_cache_init()

@@ -297,6 +297,9 @@
 
 #include "gadget_chips.h"
 
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+#include <linux/workqueue.h>
+#endif
 
 /*------------------------------------------------------------------------*/
 
@@ -312,7 +315,10 @@ static const char fsg_string_interface[] = "Mass Storage";
 
 #include "storage_common.c"
 
-
+#ifdef CONFIG_USB_CSW_HACK
+static int write_error_after_csw_sent;
+static int csw_hack_sent;
+#endif
 /*-------------------------------------------------------------------------*/
 
 struct fsg_dev;
@@ -451,6 +457,10 @@ struct fsg_dev {
 	struct usb_ep		*bulk_out;
 };
 
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+#include "pantech_cdrom.c"
+#endif
+
 static inline int __fsg_is_set(struct fsg_common *common,
 			       const char *func, unsigned line)
 {
@@ -469,6 +479,7 @@ static inline struct fsg_dev *fsg_from_func(struct usb_function *f)
 }
 
 typedef void (*fsg_routine_t)(struct fsg_dev *);
+static int send_status(struct fsg_common *common);
 
 static int exception_in_progress(struct fsg_common *common)
 {
@@ -586,6 +597,22 @@ static void bulk_out_complete(struct usb_ep *ep, struct usb_request *req)
 	struct fsg_common	*common = ep->driver_data;
 	struct fsg_buffhd	*bh = req->context;
 
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+  if(!ep || !req){
+    printk(KERN_ERR "pantech_f_mass:ep/req is null\n");
+    return;
+  }
+  if(!common || !bh){
+    printk(KERN_ERR "fsg/bh is null\n");
+    if(bh){
+      printk(KERN_ERR "bh is not null\n");
+      bh->outreq_busy = 0;
+      bh->state = BUF_STATE_FULL;
+    }
+    return;
+  }
+#endif
+
 	dump_msg(common, "bulk-out", req->buf, req->actual);
 	if (req->status || req->actual != bh->bulk_out_intended_length)
 		DBG(common, "%s --> %d, %u/%u\n", __func__,
@@ -625,7 +652,7 @@ static int fsg_setup(struct usb_function *f,
 		if (ctrl->bRequestType !=
 		    (USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE))
 			break;
-		if (w_index != fsg->interface_number || w_value != 0)
+		if (w_value != 0)
 			return -EDOM;
 
 		/*
@@ -640,10 +667,21 @@ static int fsg_setup(struct usb_function *f,
 		if (ctrl->bRequestType !=
 		    (USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE))
 			break;
-		if (w_index != fsg->interface_number || w_value != 0)
+		if (w_value != 0)
 			return -EDOM;
 		VDBG(fsg, "get max LUN\n");
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+		if(pantech_cdrom_enabled){
+			if(pantech_cdrom_only)
+				*(u8 *)req->buf = 0;
+			else
+				*(u8 *)req->buf = fsg->common->nluns - 1;
+		}
+		else
+			*(u8 *)req->buf = fsg->common->nluns - 2;
+#else
 		*(u8 *)req->buf = fsg->common->nluns - 1;
+#endif
 
 		/* Respond with data/status */
 		req->length = min((u16)1, w_length);
@@ -747,6 +785,15 @@ static int do_read(struct fsg_common *common)
 	unsigned int		amount;
 	unsigned int		partial_page;
 	ssize_t			nread;
+#ifdef CONFIG_USB_MSC_PROFILING
+	ktime_t			start, diff;
+#endif
+
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+  if(curlun->cdrom && !backing_file_is_open(curlun)){
+    return -EINVAL;
+  }
+#endif
 
 	/*
 	 * Get the starting Logical Block Address and check that it's
@@ -821,11 +868,23 @@ static int do_read(struct fsg_common *common)
 
 		/* Perform the read */
 		file_offset_tmp = file_offset;
+
+#ifdef CONFIG_USB_MSC_PROFILING
+		start = ktime_get();
+#endif
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+    if(!curlun || curlun->filp == NULL) return -EINVAL;
+#endif
 		nread = vfs_read(curlun->filp,
 				 (char __user *)bh->buf,
 				 amount, &file_offset_tmp);
 		VLDBG(curlun, "file read %u @ %llu -> %d\n", amount,
-		      (unsigned long long)file_offset, (int)nread);
+		     (unsigned long long) file_offset, (int) nread);
+#ifdef CONFIG_USB_MSC_PROFILING
+		diff = ktime_sub(ktime_get(), start);
+		curlun->perf.rbytes += nread;
+		curlun->perf.rtime = ktime_add(curlun->perf.rtime, diff);
+#endif
 		if (signal_pending(current))
 			return -EINTR;
 
@@ -881,6 +940,13 @@ static int do_write(struct fsg_common *common)
 	ssize_t			nwritten;
 	int			rc;
 
+#ifdef CONFIG_USB_CSW_HACK
+	int			i;
+#endif
+
+#ifdef CONFIG_USB_MSC_PROFILING
+	ktime_t			start, diff;
+#endif
 	if (curlun->ro) {
 		curlun->sense_data = SS_WRITE_PROTECTED;
 		return -EINVAL;
@@ -908,11 +974,13 @@ static int do_write(struct fsg_common *common)
 			curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
 			return -EINVAL;
 		}
+#if 0//ST_LIM UMS_ASYNC_FIX		
 		if (!curlun->nofua && (common->cmnd[1] & 0x08)) { /* FUA */
 			spin_lock(&curlun->filp->f_lock);
 			curlun->filp->f_flags |= O_SYNC;
 			spin_unlock(&curlun->filp->f_lock);
 		}
+#endif		
 	}
 	if (lba >= curlun->num_sectors) {
 		curlun->sense_data = SS_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE;
@@ -994,7 +1062,17 @@ static int do_write(struct fsg_common *common)
 		bh = common->next_buffhd_to_drain;
 		if (bh->state == BUF_STATE_EMPTY && !get_some_more)
 			break;			/* We stopped early */
+#ifdef CONFIG_USB_CSW_HACK
+		/*
+		 * If the csw packet is already submmitted to the hardware,
+		 * by marking the state of buffer as full, then by checking
+		 * the residue, we make sure that this csw packet is not
+		 * written on to the storage media.
+		 */
+		if (bh->state == BUF_STATE_FULL && common->residue) {
+#else
 		if (bh->state == BUF_STATE_FULL) {
+#endif
 			smp_rmb();
 			common->next_buffhd_to_drain = bh->next;
 			bh->state = BUF_STATE_EMPTY;
@@ -1018,11 +1096,20 @@ static int do_write(struct fsg_common *common)
 
 			/* Perform the write */
 			file_offset_tmp = file_offset;
+#ifdef CONFIG_USB_MSC_PROFILING
+			start = ktime_get();
+#endif
 			nwritten = vfs_write(curlun->filp,
 					     (char __user *)bh->buf,
 					     amount, &file_offset_tmp);
 			VLDBG(curlun, "file write %u @ %llu -> %d\n", amount,
 			      (unsigned long long)file_offset, (int)nwritten);
+#ifdef CONFIG_USB_MSC_PROFILING
+			diff = ktime_sub(ktime_get(), start);
+			curlun->perf.wbytes += nwritten;
+			curlun->perf.wtime =
+					ktime_add(curlun->perf.wtime, diff);
+#endif
 			if (signal_pending(current))
 				return -EINTR;		/* Interrupted! */
 
@@ -1045,9 +1132,36 @@ static int do_write(struct fsg_common *common)
 				curlun->sense_data = SS_WRITE_ERROR;
 				curlun->sense_data_info = file_offset >> 9;
 				curlun->info_valid = 1;
+#ifdef CONFIG_USB_CSW_HACK
+				write_error_after_csw_sent = 1;
+				goto write_error;
+#endif
 				break;
 			}
 
+#ifdef CONFIG_USB_CSW_HACK
+write_error:
+			if ((nwritten == amount) && !csw_hack_sent) {
+				if (write_error_after_csw_sent)
+					break;
+				/*
+				 * Check if any of the buffer is in the
+				 * busy state, if any buffer is in busy state,
+				 * means the complete data is not received
+				 * yet from the host. So there is no point in
+				 * csw right away without the complete data.
+				 */
+				for (i = 0; i < FSG_NUM_BUFFERS; i++) {
+					if (common->buffhds[i].state ==
+							BUF_STATE_BUSY)
+						break;
+				}
+				if (!amount_left_to_req && i == FSG_NUM_BUFFERS) {
+					csw_hack_sent = 1;
+					send_status(common);
+				}
+			}
+#endif
 			/* Did the host decide to stop early? */
 			if (bh->outreq->actual != bh->outreq->length) {
 				common->short_packet_received = 1;
@@ -1104,6 +1218,12 @@ static int do_verify(struct fsg_common *common)
 	u32			amount_left;
 	unsigned int		amount;
 	ssize_t			nread;
+
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+  if(curlun->cdrom && !backing_file_is_open(curlun)){
+    return -EINVAL;
+  }
+#endif
 
 	/*
 	 * Get the starting Logical Block Address and check that it's
@@ -1164,6 +1284,9 @@ static int do_verify(struct fsg_common *common)
 
 		/* Perform the read */
 		file_offset_tmp = file_offset;
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+    if(!curlun || curlun->filp == NULL) return -EINVAL;
+#endif
 		nread = vfs_read(curlun->filp,
 				(char __user *) bh->buf,
 				amount, &file_offset_tmp);
@@ -1469,6 +1592,13 @@ static int do_start_stop(struct fsg_common *common)
 	if (!loej)
 		return 0;
 
+// tarial fixed this code
+// reason : after eject command, file pointer remove only.
+#if 0//def CONFIG_ANDROID_PANTECH_USB_CDFREE
+	if (common->curlun && common->curlun->cdrom)
+		pantech_f_cdrom_eject_cdrom();
+#endif
+		
 	/* Simulate an unload/eject */
 	if (common->ops && common->ops->pre_eject) {
 		int r = common->ops->pre_eject(common, curlun,
@@ -1508,8 +1638,7 @@ static int do_prevent_allow(struct fsg_common *common)
 		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
 		return -EINVAL;
 	}
-
-	if (curlun->prevent_medium_removal && !prevent)
+	if (!curlun->nofua && curlun->prevent_medium_removal && !prevent)
 		fsg_lun_fsync_sub(curlun);
 	curlun->prevent_medium_removal = prevent;
 	return 0;
@@ -1790,6 +1919,19 @@ static int send_status(struct fsg_common *common)
 	csw->Signature = cpu_to_le32(USB_BULK_CS_SIG);
 	csw->Tag = common->tag;
 	csw->Residue = cpu_to_le32(common->residue);
+#ifdef CONFIG_USB_CSW_HACK
+	/* Since csw is being sent early, before
+	 * writing on to storage media, need to set
+	 * residue to zero,assuming that write will succeed.
+	 */
+	if (write_error_after_csw_sent) {
+		write_error_after_csw_sent = 0;
+		csw->Residue = cpu_to_le32(common->residue);
+	} else
+		csw->Residue = 0;
+#else
+	csw->Residue = cpu_to_le32(common->residue);
+#endif
 	csw->Status = status;
 
 	bh->inreq->length = USB_BULK_CS_WRAP_LEN;
@@ -1964,6 +2106,43 @@ static int do_scsi_command(struct fsg_common *common)
 	down_read(&common->filesem);	/* We're using the backing file */
 	switch (common->cmnd[0]) {
 
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+  case USBSDMS_MODE_GET_DEVICEMODE:
+    common->data_size_from_cmnd = common->data_size;
+    reply = pantech_cdrom_do_mode_get_device_information(common, bh); 
+    break;
+    
+  case USBSDMS_MODE_CHANGE_VOLATILITY_CODE:
+    reply = pantech_cdrom_do_mode_change_volatility_code(common, bh); 
+    break;
+
+  case USBSDMS_MODE_CHANGE_CANCEL_TIMER:
+    //reply = do_mode_change_nv_code(fsg, bh);
+    reply = pantech_cdrom_do_cancel_cdrom_mode_timer(common, bh); 
+    break;
+
+  case USBSDMS_GET_CONFIGURATION_CODE:
+    /*   
+    if ((reply = check_command(fsg, 6, DATA_DIR_TO_HOST,
+        (1<<4), 0,
+        "GET CONFIGURATION")) == 0)
+        */
+    common->data_size_from_cmnd = common->data_size;
+    reply = pantech_cdrom_do_get_configuration_code(common, bh); 
+    break;
+#if 0//TOC
+  case USBSDMS_READ_TOC_PMA_CODE:
+  /*   
+    if ((reply = check_command(fsg, 10, DATA_DIR_TO_HOST,
+        (1) | (1<<7) | (1<<8), 1,
+        "READ TOC")) == 0)
+  */     
+    common->data_size_from_cmnd = common->data_size;
+    reply = pantech_cdrom_do_read_toc(common, bh);
+    break;
+#endif
+#endif
+
 	case INQUIRY:
 		common->data_size_from_cmnd = common->cmnd[4];
 		reply = check_command(common, 6, DATA_DIR_TO_HOST,
@@ -2007,8 +2186,17 @@ static int do_scsi_command(struct fsg_common *common)
 		reply = check_command(common, 10, DATA_DIR_TO_HOST,
 				      (1<<1) | (1<<2) | (3<<7), 0,
 				      "MODE SENSE(10)");
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+		if (reply == 0){
+			if(common->curlun && common->curlun->cdrom)
+				reply = pantech_cdrom_do_mode_sense10(common, bh);
+			else
+				reply = do_mode_sense(common, bh);
+		}
+#else
 		if (reply == 0)
 			reply = do_mode_sense(common, bh);
+#endif
 		break;
 
 	case ALLOW_MEDIUM_REMOVAL:
@@ -2074,6 +2262,23 @@ static int do_scsi_command(struct fsg_common *common)
 	case READ_TOC:
 		if (!common->curlun || !common->curlun->cdrom)
 			goto unknown_cmnd;
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+		if(common->curlun->cdrom){
+			common->data_size_from_cmnd =
+				get_unaligned_be16(&common->cmnd[7]);
+			//common->data_size_from_cmnd = common->data_size;
+			reply = pantech_cdrom_do_read_toc(common, bh);
+		}else{
+			common->data_size_from_cmnd =
+				get_unaligned_be16(&common->cmnd[7]);
+			reply = check_command(common, 10, DATA_DIR_TO_HOST,
+														(7<<6) | (1<<1), 1,
+														"READ TOC");
+			if (reply == 0)
+				reply = do_read_toc(common, bh);
+
+		}
+#else
 		common->data_size_from_cmnd =
 			get_unaligned_be16(&common->cmnd[7]);
 		reply = check_command(common, 10, DATA_DIR_TO_HOST,
@@ -2081,6 +2286,7 @@ static int do_scsi_command(struct fsg_common *common)
 				      "READ TOC");
 		if (reply == 0)
 			reply = do_read_toc(common, bh);
+#endif
 		break;
 
 	case READ_FORMAT_CAPACITIES:
@@ -2277,6 +2483,13 @@ static int received_cbw(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 	common->data_size = le32_to_cpu(cbw->DataTransferLength);
 	if (common->data_size == 0)
 		common->data_dir = DATA_DIR_NONE;
+
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+	if(pantech_cdrom_only){
+		cbw->Lun = common->nluns -1;
+	}
+#endif
+
 	common->lun = cbw->Lun;
 	common->tag = cbw->Tag;
 	return 0;
@@ -2349,7 +2562,6 @@ static int alloc_request(struct fsg_common *common, struct usb_ep *ep,
 /* Reset interface setting and re-init endpoint state (toggle etc). */
 static int do_set_interface(struct fsg_common *common, struct fsg_dev *new_fsg)
 {
-	const struct usb_endpoint_descriptor *d;
 	struct fsg_dev *fsg;
 	int i, rc = 0;
 
@@ -2374,15 +2586,6 @@ reset:
 			}
 		}
 
-		/* Disable the endpoints */
-		if (fsg->bulk_in_enabled) {
-			usb_ep_disable(fsg->bulk_in);
-			fsg->bulk_in_enabled = 0;
-		}
-		if (fsg->bulk_out_enabled) {
-			usb_ep_disable(fsg->bulk_out);
-			fsg->bulk_out_enabled = 0;
-		}
 
 		common->fsg = NULL;
 		wake_up(&common->fsg_wait);
@@ -2395,22 +2598,6 @@ reset:
 	common->fsg = new_fsg;
 	fsg = common->fsg;
 
-	/* Enable the endpoints */
-	d = fsg_ep_desc(common->gadget,
-			&fsg_fs_bulk_in_desc, &fsg_hs_bulk_in_desc);
-	rc = enable_endpoint(common, fsg->bulk_in, d);
-	if (rc)
-		goto reset;
-	fsg->bulk_in_enabled = 1;
-
-	d = fsg_ep_desc(common->gadget,
-			&fsg_fs_bulk_out_desc, &fsg_hs_bulk_out_desc);
-	rc = enable_endpoint(common, fsg->bulk_out, d);
-	if (rc)
-		goto reset;
-	fsg->bulk_out_enabled = 1;
-	common->bulk_out_maxpacket = le16_to_cpu(d->wMaxPacketSize);
-	clear_bit(IGNORE_BULK_OUT, &fsg->atomic_bitflags);
 
 	/* Allocate the requests */
 	for (i = 0; i < FSG_NUM_BUFFERS; ++i) {
@@ -2440,14 +2627,64 @@ reset:
 static int fsg_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 {
 	struct fsg_dev *fsg = fsg_from_func(f);
+	struct fsg_common *common = fsg->common;
+	const struct usb_endpoint_descriptor *d;
+	int rc;
+
+	/* Enable the endpoints */
+	d = fsg_ep_desc(common->gadget,
+			&fsg_fs_bulk_in_desc, &fsg_hs_bulk_in_desc);
+	rc = enable_endpoint(common, fsg->bulk_in, d);
+	if (rc)
+		return rc;
+	fsg->bulk_in_enabled = 1;
+
+	d = fsg_ep_desc(common->gadget,
+			&fsg_fs_bulk_out_desc, &fsg_hs_bulk_out_desc);
+	rc = enable_endpoint(common, fsg->bulk_out, d);
+	if (rc) {
+		usb_ep_disable(fsg->bulk_in);
+		fsg->bulk_in_enabled = 0;
+		return rc;
+	}
+	fsg->bulk_out_enabled = 1;
+	common->bulk_out_maxpacket = le16_to_cpu(d->wMaxPacketSize);
+	clear_bit(IGNORE_BULK_OUT, &fsg->atomic_bitflags);
 	fsg->common->new_fsg = fsg;
 	raise_exception(fsg->common, FSG_STATE_CONFIG_CHANGE);
+#ifdef CONFIG_ANDROID_PANTECH_USB_MANAGER
+#ifdef CONFIG_ANDROID_PANTECH_USB_CDFREE
+	if(pantech_cdrom_enabled){
+		if(pantech_cdrom_only){
+			usb_interface_enum_cb(CDROM_TYPE_FLAG);
+		}else{
+			usb_interface_enum_cb(MSC_TYPE_FLAG | CDROM_TYPE_FLAG);
+		}
+	}else{
+		usb_interface_enum_cb(MSC_TYPE_FLAG);
+	}
+#else
+	usb_interface_enum_cb(MSC_TYPE_FLAG);
+#endif
+#endif
 	return USB_GADGET_DELAYED_STATUS;
 }
 
 static void fsg_disable(struct usb_function *f)
 {
 	struct fsg_dev *fsg = fsg_from_func(f);
+
+	/* Disable the endpoints */
+	if (fsg->bulk_in_enabled) {
+		usb_ep_disable(fsg->bulk_in);
+		fsg->bulk_in_enabled = 0;
+		fsg->bulk_in->driver_data = NULL;
+	}
+	if (fsg->bulk_out_enabled) {
+		usb_ep_disable(fsg->bulk_out);
+		fsg->bulk_out_enabled = 0;
+		fsg->bulk_out->driver_data = NULL;
+	}
 	fsg->common->new_fsg = NULL;
 	raise_exception(fsg->common, FSG_STATE_CONFIG_CHANGE);
 }
@@ -2654,6 +2891,16 @@ static int fsg_main_thread(void *common_)
 			common->state = FSG_STATE_STATUS_PHASE;
 		spin_unlock_irq(&common->lock);
 
+#ifdef CONFIG_USB_CSW_HACK
+		/* Since status is already sent for write scsi command,
+		 * need to skip sending status once again if it is a
+		 * write scsi command.
+		 */
+		if (csw_hack_sent) {
+			csw_hack_sent = 0;
+			continue;
+		}
+#endif
 		if (send_status(common))
 			continue;
 
@@ -2694,7 +2941,9 @@ static int fsg_main_thread(void *common_)
 static DEVICE_ATTR(ro, 0644, fsg_show_ro, fsg_store_ro);
 static DEVICE_ATTR(nofua, 0644, fsg_show_nofua, fsg_store_nofua);
 static DEVICE_ATTR(file, 0644, fsg_show_file, fsg_store_file);
-
+#ifdef CONFIG_USB_MSC_PROFILING
+static DEVICE_ATTR(perf, 0644, fsg_show_perf, fsg_store_perf);
+#endif
 
 /****************************** FSG COMMON ******************************/
 
@@ -2779,6 +3028,7 @@ static struct fsg_common *fsg_common_init(struct fsg_common *common,
 		curlun->ro = lcfg->cdrom || lcfg->ro;
 		curlun->initially_ro = curlun->ro;
 		curlun->removable = lcfg->removable;
+		curlun->nofua = lcfg->nofua;
 		curlun->dev.release = fsg_lun_release;
 		curlun->dev.parent = &gadget->dev;
 		/* curlun->dev.driver = &fsg_driver.driver; XXX */
@@ -2806,7 +3056,12 @@ static struct fsg_common *fsg_common_init(struct fsg_common *common,
 		rc = device_create_file(&curlun->dev, &dev_attr_nofua);
 		if (rc)
 			goto error_luns;
-
+#ifdef CONFIG_USB_MSC_PROFILING
+		rc = device_create_file(&curlun->dev, &dev_attr_perf);
+		if (rc)
+			dev_err(&gadget->dev, "failed to create sysfs entry:"
+				"(dev_attr_perf) error: %d\n", rc);
+#endif
 		if (lcfg->filename) {
 			rc = fsg_lun_open(curlun, lcfg->filename);
 			if (rc)
@@ -2935,6 +3190,9 @@ static void fsg_common_release(struct kref *ref)
 
 		/* In error recovery common->nluns may be zero. */
 		for (; i; --i, ++lun) {
+#ifdef CONFIG_USB_MSC_PROFILING
+			device_remove_file(&lun->dev, &dev_attr_perf);
+#endif
 			device_remove_file(&lun->dev, &dev_attr_nofua);
 			device_remove_file(&lun->dev, &dev_attr_ro);
 			device_remove_file(&lun->dev, &dev_attr_file);
@@ -3026,6 +3284,12 @@ static int fsg_bind(struct usb_configuration *c, struct usb_function *f)
 		}
 	}
 
+// tarial fixed this code
+// reason : after eject command, file pointer remove only.
+#if 0//def CONFIG_ANDROID_PANTECH_USB_CDFREE
+	INIT_DELAYED_WORK(&cancel_work, pantech_cancel_timeout_cdrom_mode);
+#endif
+
 	return 0;
 
 autoconf_fail:
@@ -3052,7 +3316,7 @@ static int fsg_bind_config(struct usb_composite_dev *cdev,
 	if (unlikely(!fsg))
 		return -ENOMEM;
 
-	fsg->function.name        = FSG_DRIVER_DESC;
+	fsg->function.name        = "mass_storage";
 	fsg->function.strings     = fsg_strings_array;
 	fsg->function.bind        = fsg_bind;
 	fsg->function.unbind      = fsg_unbind;

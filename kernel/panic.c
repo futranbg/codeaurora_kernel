@@ -24,8 +24,15 @@
 #include <linux/nmi.h>
 #include <linux/dmi.h>
 
+#ifdef CONFIG_PANTECH_DEBUG_SCHED_LOG  //p14291_121102
+#include <mach/pantech_apanic.h>
+#endif
+
 #define PANIC_TIMER_STEP 100
 #define PANIC_BLINK_SPD 18
+
+/* Machine specific panic information string */
+char *mach_panic_string;
 
 int panic_on_oops;
 static unsigned long tainted_mask;
@@ -33,7 +40,10 @@ static int pause_on_oops;
 static int pause_on_oops_flag;
 static DEFINE_SPINLOCK(pause_on_oops_lock);
 
-int panic_timeout;
+#ifndef CONFIG_PANIC_TIMEOUT
+#define CONFIG_PANIC_TIMEOUT 0
+#endif
+int panic_timeout = CONFIG_PANIC_TIMEOUT;
 EXPORT_SYMBOL_GPL(panic_timeout);
 
 ATOMIC_NOTIFIER_HEAD(panic_notifier_list);
@@ -71,12 +81,21 @@ NORET_TYPE void panic(const char * fmt, ...)
 	 */
 	preempt_disable();
 
+#ifdef CONFIG_PANTECH_DEBUG_SCHED_LOG  //p14291_121102
+    pantechdbg_sched_msg("!!panic!!");
+#endif
+
 	console_verbose();
 	bust_spinlocks(1);
 	va_start(args, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
 	printk(KERN_EMERG "Kernel panic - not syncing: %s\n",buf);
+	
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+	__save_regs_and_mmu_in_panic();
+#endif
+
 #ifdef CONFIG_DEBUG_BUGVERBOSE
 	dump_stack();
 #endif
@@ -342,6 +361,11 @@ late_initcall(init_oops_id);
 void print_oops_end_marker(void)
 {
 	init_oops_id();
+
+	if (mach_panic_string)
+		printk(KERN_WARNING "Board Information: %s\n",
+		       mach_panic_string);
+
 	printk(KERN_WARNING "---[ end trace %016llx ]---\n",
 		(unsigned long long)oops_id);
 }

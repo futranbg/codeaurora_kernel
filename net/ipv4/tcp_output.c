@@ -2598,8 +2598,12 @@ static void tcp_connect_init(struct sock *sk)
 	tp->rcv_nxt = 0;
 	tp->rcv_wup = 0;
 	tp->copied_seq = 0;
-
-	inet_csk(sk)->icsk_rto = TCP_TIMEOUT_INIT;
+//[ FEATURE_LGT_DS_TCP_SYN_RETRANSMIT
+// Block Original
+//	inet_csk(sk)->icsk_rto = TCP_TIMEOUT_INIT;
+	inet_csk(sk)->icsk_rto = 100;	
+//] FEATURE_LGT_DS_TCP_SYN_RETRANSMIT
+	
 	inet_csk(sk)->icsk_retransmits = 0;
 	tcp_clear_retrans(tp);
 }

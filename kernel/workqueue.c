@@ -44,6 +44,10 @@
 
 #include "workqueue_sched.h"
 
+#ifdef CONFIG_PANTECH_DEBUG_SCHED_LOG  //p14291_121102
+#include <mach/pantech_apanic.h>
+#endif
+
 enum {
 	/* global_cwq flags */
 	GCWQ_MANAGE_WORKERS	= 1 << 0,	/* need to manage workers */
@@ -1865,6 +1869,11 @@ __acquires(&gcwq->lock)
 	lock_map_acquire_read(&cwq->wq->lockdep_map);
 	lock_map_acquire(&lockdep_map);
 	trace_workqueue_execute_start(work);
+
+#ifdef CONFIG_PANTECH_DEBUG_SCHED_LOG  //p14291_121102
+	pantechdbg_sched_msg("@%pS", f);
+#endif
+
 	f(work);
 	/*
 	 * While we must be careful to not use "work" after this, the trace
